@@ -31,36 +31,62 @@ public class Server {
         this.port = port;
     }
 
-    @SneakyThrows(IOException.class)
     public void start() {
+        try (val serverSocketChannel = openAndBind(port);
+             val selector = Selector.open()) {
+            serverSocketChannel.register(selector, SelectionKey.OP_ACCEPT);
+            while (!Thread.currentThread().isInterrupted()) {
+                selector.select();
+                selector.selectedKeys().removeIf(key -> {
+                    if (!key.isValid()) {
+                        log.debug("Key is not valid");
+                    } else if (key.isAcceptable()) {
+                        accept(key);
+                    } else if (key.isReadable()) {
+                        read(key);
+                    } else if (key.isWritable()) {
+                        write(key);
+                    }
+                    return true;
+                });
+            }
+        } catch (IOException e) {
+            log.error(e.getMessage());
+        }
+    }
+
+    private ServerSocketChannel openAndBind(int port) throws IOException {
         val serverSocketChannel = ServerSocketChannel.open();
         serverSocketChannel.bind(new InetSocketAddress(port));
         serverSocketChannel.configureBlocking(false);
-        val selector = Selector.open();
-        serverSocketChannel.register(selector, SelectionKey.OP_ACCEPT);
-
-        while (!Thread.currentThread().isInterrupted()) {
-            selector.select();
-            selector.selectedKeys().removeIf(key -> {
-                if (key.isAcceptable()) {
-                    accept(key);
-                }
-                return true;
-            });
-        }
+        return serverSocketChannel;
     }
 
     private void accept(SelectionKey key) {
         try {
-            SocketChannel socketChannel = ((ServerSocketChannel) key.channel()).accept();
+            val socketChannel = ((ServerSocketChannel) key.channel()).accept();
             socketChannel.configureBlocking(false);
             socketChannel.register(key.selector(), SelectionKey.OP_READ);
-            //that's bad
-            socketChannel.write(ByteBuffer.wrap(getResponse(HTML).getBytes()));
-            log.info("Accepted");
+            log.info(String.format("Accepted {%s}", socketChannel));
         } catch (IOException e) {
             log.error("Error while accepting");
         }
+    }
+
+    private void read(SelectionKey key) {
+        //val socketChannel = (SocketChannel) key.channel();
+        //... reading
+        key.interestOps(SelectionKey.OP_WRITE);
+    }
+
+    @SneakyThrows(IOException.class)
+    private void write(SelectionKey key) {
+        val socketChannel = (SocketChannel) key.channel();
+        val buffer = ByteBuffer.wrap(getResponse(HTML).getBytes());
+        while (buffer.hasRemaining()) {
+            socketChannel.write(buffer);
+        }
+        socketChannel.close();
     }
 
     private String getResponse(String content) {
