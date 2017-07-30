@@ -1,6 +1,5 @@
 package net;
 
-import lombok.SneakyThrows;
 import lombok.extern.log4j.Log4j2;
 import lombok.val;
 
@@ -16,7 +15,6 @@ import java.util.HashMap;
 import java.util.Map;
 
 //TODO: add multithreading
-//TODO: add correct exceptions handling
 @SuppressWarnings("WeakerAccess")
 @Log4j2
 public class Server {
@@ -30,7 +28,20 @@ public class Server {
             "HTTP/1.1 404 Not Found\r\n" +
                     "Connection: close\r\n\r\n";
 
-    private static final String START_HTML =
+    private static final String RESPONSE_NOT_IMPLEMENTED =
+            "HTTP/1.1 501 Method Not Implemented\r\n" +
+                    "Allow: GET,POST\r\n" +
+                    "Content-Length: %d\r\n" +
+                    "Connection: close\r\n" +
+                    "Content-Type: text/html\r\n\r\n%s";
+
+    private static final String RESPONSE_SERVER_ERROR =
+            "HTTP/1.1 500 Internal Server Error\r\n" +
+                    "Content-Length: %d\r\n" +
+                    "Connection: close\r\n" +
+                    "Content-Type: text/html\r\n\r\n%s";
+
+    private static final String HTML_START =
             "<html>\n" +
                     " <head>\n" +
                     "  <title>Starter</title>\n" +
@@ -54,8 +65,38 @@ public class Server {
                     " </body>\n" +
                     "</html>";
 
-    private static final String HTML =
-            "<html><head><meta charset=\"utf-8\"/></head><body><h1>%s</h1><pre>%s</pre></body></html>";
+    private static final String HTML_OK =
+            "<html>" +
+                    " <head>" +
+                    "  <meta charset=\"utf-8\"/>" +
+                    " </head>" +
+                    " <body>" +
+                    "  <h1>%s</h1>" +
+                    "  <pre>%s</pre>" +
+                    " </body>" +
+                    "</html>";
+
+    private static final String HTML_NOT_IMPLEMENTED =
+            "<html>" +
+                    " <head>\n" +
+                    "  <title>501 Method Not Implemented</title>\n" +
+                    " </head>" +
+                    " <body>\n" +
+                    "  <h1>Method Not Implemented</h1>\n" +
+                    "  <p>this method is not supported.<br></p>\n" +
+                    " </body>" +
+                    "</html>";
+
+    private static final String HTML_SERVER_ERROR =
+            "<html>" +
+                    " <head>\n" +
+                    "  <title>500 Internal Server Error</title>\n" +
+                    " </head>" +
+                    " <body>\n" +
+                    "  <h1>Internal server error</h1>\n" +
+                    "  <p>Error occurred:<br>%s</p>\n" +
+                    " </body>" +
+                    "</html>";
 
 
     private final int port;
@@ -95,6 +136,7 @@ public class Server {
                     }
                     return true;
                 });
+                map.keySet().removeIf(key -> !key.isValid());
             }
         } catch (IOException e) {
             log.error(e.getMessage());
@@ -122,12 +164,13 @@ public class Server {
         }
     }
 
-
     private void read(SelectionKey key) {
         val socketChannel = (SocketChannel) key.channel();
+        val request = map.get(key);
+        val buffer = (ByteBuffer) key.attachment();
         try {
-            val request = map.get(key);
-            val buffer = (ByteBuffer) key.attachment();
+            //to demonstrate behaviour when the error occurs
+            //request.getMethod().hashCode();
             val bytesRead = socketChannel.read(buffer);
             log.debug(String.format("Received %d bytes", bytesRead));
             buffer.flip();
@@ -198,8 +241,11 @@ public class Server {
             buffer.reset();
             buffer.compact();
             log.debug("Received not a full message. Continue...");
-        } catch (IOException e) {
-            e.printStackTrace();
+        } catch (Exception e) {
+            log.error(e.getMessage());
+            request.clear();
+            request.addToBody(e.toString());
+            key.interestOps(SelectionKey.OP_WRITE);
         }
     }
 
@@ -209,41 +255,51 @@ public class Server {
         return new String(useful);
     }
 
-    @SneakyThrows(IOException.class)
     private void write(SelectionKey key) {
-        val socketChannel = (SocketChannel) key.channel();
-        val request = map.get(key);
-        val buffer = (ByteBuffer) key.attachment();
-        String response = null;
-        switch (request.getMethod()) {
-            case GET:
-                if (request.getPath().equals("/") && request.getParams().size() == 0) {
-                    response = getResponse(START_HTML);
-                } else if (request.getParams().size() > 0) {
-                    response = getResponse(String.format(HTML, request.getMethod().name(), request.toString()));
+        try (val socketChannel = (SocketChannel) key.channel()) {
+            val request = map.get(key);
+            val buffer = (ByteBuffer) key.attachment();
+            String response;
+            if (request.getMethod() == null) {
+                response = getResponse(RESPONSE_SERVER_ERROR,
+                        String.format(HTML_SERVER_ERROR, request.getBody()));
+            } else {
+                switch (request.getMethod()) {
+                    case GET:
+                        if (request.getPath().equals("/") && request.getParams().size() == 0) {
+                            response = getResponse(RESPONSE_OK, HTML_START);
+                        } else if (request.getParams().size() > 0) {
+                            response = getResponse(RESPONSE_OK,
+                                    String.format(HTML_OK, request.getMethod().name(), request.toString()));
+                        } else {
+                            response = RESPONSE_NOT_FOUND;
+                        }
+                        break;
+                    case POST:
+                        response = getResponse(RESPONSE_OK,
+                                String.format(HTML_OK, request.getMethod().name(), request.toString()));
+                        break;
+                    default:
+                        response = getResponse(RESPONSE_NOT_IMPLEMENTED, HTML_NOT_IMPLEMENTED);
                 }
-                break;
-            case POST:
-                response = getResponse(String.format(HTML, request.getMethod().name(), request.toString()));
-                break;
-            default:
-                response = RESPONSE_NOT_FOUND;
+            }
+            log.debug(String.format("Response: %s", response));
+            //noinspection ConstantConditions
+            val bytes = response.getBytes();
+            for (int i = 0; i < bytes.length; i += bufferCapacity) {
+                buffer.put(Arrays.copyOfRange(bytes, i, i + bufferCapacity));
+                buffer.flip();
+                socketChannel.write(buffer);
+                buffer.clear();
+            }
+            request.clear();
+        } catch (IOException e) {
+            log.error(e.getMessage());
         }
-        log.debug(String.format("Response: %s", response));
-        //noinspection ConstantConditions
-        val bytes = response.getBytes();
-        for (int i = 0; i < bytes.length; i += bufferCapacity) {
-            buffer.put(Arrays.copyOfRange(bytes, i, i + bufferCapacity));
-            buffer.flip();
-            socketChannel.write(buffer);
-            buffer.clear();
-        }
-        request.clear();
-        socketChannel.close();
     }
 
-    private String getResponse(String content) {
-        return String.format(RESPONSE_OK, content.length(), content);
+    private String getResponse(String template, String content) {
+        return String.format(template, content.length(), content);
     }
 
     private Map<String, String> getParams(String s) {
