@@ -11,21 +11,51 @@ import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
-import java.util.Collections;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 
+//TODO: add multithreading
+//TODO: add correct exceptions handling
 @SuppressWarnings("WeakerAccess")
 @Log4j2
 public class Server {
-    private static final String RESPONSE =
+    private static final String RESPONSE_OK =
             "HTTP/1.1 200 OK\r\n" +
                     "Content-Type: text/html\r\n" +
                     "Content-Length: %d\r\n" +
                     "Connection: close\r\n\r\n%s";
 
+    private static final String RESPONSE_NOT_FOUND =
+            "HTTP/1.1 404 Not Found\r\n" +
+                    "Connection: close\r\n\r\n";
+
+    private static final String START_HTML =
+            "<html>\n" +
+                    " <head>\n" +
+                    "  <title>Starter</title>\n" +
+                    "  <meta charset=\"utf-8\"/>" +
+                    " </head>\n" +
+                    " <body>\n" +
+                    " <h1>Различные виды запросов</h1>" +
+                    " <h2>GET</h2>" +
+                    " <form method=\"get\" action=\"/auth\">\n" +
+                    "    Enter your name: <input type=\"text\" name=\"username\"><br />\n" +
+                    "    Enter your password: <input type=\"password\" name=\"password\"><br />\n" +
+                    "    <input type=\"submit\" value=\"SEND\" />\n" +
+                    "  </form>\n" +
+                    " <br>" +
+                    " <h2>POST</h2>" +
+                    " <form method=\"post\" action=\"/auth\">\n" +
+                    "    Enter your name: <input type=\"text\" name=\"username\"><br />\n" +
+                    "    Enter your password: <input type=\"password\" name=\"password\"><br />\n" +
+                    "    <input type=\"submit\" value=\"SEND\" />\n" +
+                    "  </form>\n" +
+                    " </body>\n" +
+                    "</html>";
+
     private static final String HTML =
-            "<html><head><meta charset=\"utf-8\"/></head><body><h1>Привет от Habrahabr`а!..</h1></body></html>";
+            "<html><head><meta charset=\"utf-8\"/></head><body><h1>%s</h1><pre>%s</pre></body></html>";
 
 
     private final int port;
@@ -98,7 +128,8 @@ public class Server {
         try {
             val request = map.get(key);
             val buffer = (ByteBuffer) key.attachment();
-            socketChannel.read(buffer);
+            val bytesRead = socketChannel.read(buffer);
+            log.debug(String.format("Received %d bytes", bytesRead));
             buffer.flip();
             buffer.mark();
             while (buffer.hasRemaining()) {
@@ -118,27 +149,24 @@ public class Server {
                     if (currentPhase == 0) {
                         //reading request line
                         String[] contentAndTail = line.split("\\s", 2);
-                        val httpMethod = HttpMethod.valueOf(contentAndTail[0]);
-
+                        request.setMethod(HttpMethod.valueOf(contentAndTail[0]));
                         contentAndTail = contentAndTail[1].split("[?\\s]", 2);
-                        val path = contentAndTail[0];
-
-                        Map<String, String> params = contentAndTail[1].startsWith("HTTP") ?
-                                Collections.emptyMap() :
-                                getParams(contentAndTail[1].split("\\s", 2)[0]);
-
-                        request.setMethod(httpMethod);
-                        request.setPath(path);
-                        request.setParams(params);
+                        request.setPath(contentAndTail[0]);
+                        String version;
+                        if (contentAndTail[1].startsWith("HTTP")) {
+                            version = contentAndTail[1];
+                        } else {
+                            contentAndTail = contentAndTail[1].split("\\s", 2);
+                            request.getParams().putAll(getParams(contentAndTail[0]));
+                            version = contentAndTail[1];
+                        }
+                        request.setVersion(version);
                         request.setPhase(currentPhase + 1);
                     } else if (currentPhase == 1) {
                         //reading request headers
                         if (line.isEmpty()) {
                             request.setPhase(currentPhase + 1);
                         } else {
-                            if (request.getHeaders() == null) {
-                                request.setHeaders(new HashMap<>());
-                            }
                             val map = request.getHeaders();
                             String[] header = line.split(":\\s", 2);
                             map.put(header[0], header[1]);
@@ -152,26 +180,27 @@ public class Server {
                     int end = buffer.position();
                     buffer.reset();
                     String body = extractString(buffer, end - buffer.position());
+                    buffer.clear();
                     int len = Integer.parseInt(length);
                     request.addToBody(body);
                     if (body.length() != len) {
-                        buffer.clear();
                         //not full message received
+                        log.debug("Received not a full message. Continue...");
                         return;
                     }
                 }
+                buffer.clear();
+                log.debug(String.format("Request: %s", request));
                 key.interestOps(SelectionKey.OP_WRITE);
+                return;
             }
             //if here, not full message received. Waiting for the next part, don't change OP
             buffer.reset();
             buffer.compact();
-        } catch (
-                IOException e)
-
-        {
+            log.debug("Received not a full message. Continue...");
+        } catch (IOException e) {
             e.printStackTrace();
         }
-
     }
 
     private String extractString(ByteBuffer buffer, int length) {
@@ -183,15 +212,38 @@ public class Server {
     @SneakyThrows(IOException.class)
     private void write(SelectionKey key) {
         val socketChannel = (SocketChannel) key.channel();
-        val buffer = ByteBuffer.wrap(getResponse(HTML).getBytes());
-        while (buffer.hasRemaining()) {
-            socketChannel.write(buffer);
+        val request = map.get(key);
+        val buffer = (ByteBuffer) key.attachment();
+        String response = null;
+        switch (request.getMethod()) {
+            case GET:
+                if (request.getPath().equals("/") && request.getParams().size() == 0) {
+                    response = getResponse(START_HTML);
+                } else if (request.getParams().size() > 0) {
+                    response = getResponse(String.format(HTML, request.getMethod().name(), request.toString()));
+                }
+                break;
+            case POST:
+                response = getResponse(String.format(HTML, request.getMethod().name(), request.toString()));
+                break;
+            default:
+                response = RESPONSE_NOT_FOUND;
         }
+        log.debug(String.format("Response: %s", response));
+        //noinspection ConstantConditions
+        val bytes = response.getBytes();
+        for (int i = 0; i < bytes.length; i += bufferCapacity) {
+            buffer.put(Arrays.copyOfRange(bytes, i, i + bufferCapacity));
+            buffer.flip();
+            socketChannel.write(buffer);
+            buffer.clear();
+        }
+        request.clear();
         socketChannel.close();
     }
 
     private String getResponse(String content) {
-        return String.format(RESPONSE, content.length(), content);
+        return String.format(RESPONSE_OK, content.length(), content);
     }
 
     private Map<String, String> getParams(String s) {
@@ -204,6 +256,6 @@ public class Server {
     }
 
     public static void main(String[] args) {
-        new Server(1024, 128).start();
+        new Server(1024, 1024).start();
     }
 }
